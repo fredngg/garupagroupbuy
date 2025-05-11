@@ -20,15 +20,11 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler, # Import ConversationHandler
     CallbackQueryHandler, # Import CallbackQueryHandler for buttons
-    # --- Persistence Imports (Required for GCF - Uncomment and configure) ---
-    # PicklePersistence, # Simple file-based persistence (less suitable for GCF)
-    # BasePersistence,
-    # Note: FirestorePersistence might require a separate installation or be part of PTB depending on version.
-    # Check PTB documentation for the recommended way to use Firestore.
-    # Example: from telegram.ext import FirestorePersistence
-    # Example: from google.cloud import firestore # Requires google-cloud-firestore library
-    # --- End Persistence Imports ---
+    # --- Persistence Imports ---
+    FirestorePersistence # For PTB v20+
 )
+# Requires google-cloud-firestore to be installed
+from google.cloud import firestore
 # Import escape_markdown helper
 from telegram.helpers import escape_markdown
 
@@ -60,18 +56,29 @@ try:
     BOT_TOKEN = os.environ['BOT_TOKEN']
     logger.info(f"Attempting init with BOT_TOKEN ending: ...{BOT_TOKEN[-4:] if BOT_TOKEN else 'N/A'}")
 
-    # --- Persistence Setup (NEEDS ACTUAL IMPLEMENTATION FOR GCF) ---
-    persistence = None # Default to no persistence
-    # Example using FirestorePersistence (Requires setup described previously):
-    # try:
-    #     firestore_client = firestore.Client()
-    #     firestore_client.collection('__test_persistence__').limit(1).get()
-    #     logger.info("Firestore client initialized successfully.")
-    #     persistence = FirestorePersistence(firestore_client=firestore_client, store_user_data=True, store_chat_data=False, store_bot_data=True)
-    #     logger.info("Using FirestorePersistence.")
-    # except Exception as e_fs:
-    #     logger.error(f"Failed to initialize Firestore client or persistence: {e_fs}. CONVERSATIONS WILL LIKELY FAIL INTERMITTENTLY.", exc_info=True)
-    #     persistence = None
+    # --- Persistence Setup using Firestore ---
+    persistence = None
+    try:
+        # Initialize Firestore client.
+        # For GCF, if Firestore is in the same project, credentials should be handled automatically
+        # by the runtime service account, provided it has "Cloud Datastore User" role or equivalent.
+        # For local testing, ensure GOOGLE_APPLICATION_CREDENTIALS env var is set.
+        firestore_client = firestore.AsyncClient() # Use AsyncClient for async PTB
+        logger.info("Firestore client initialized successfully (or will be on first use).")
+
+        # collection_name can be customized if needed, e.g., "userBotStates"
+        # Default collection name is "ptb_persistence"
+        persistence = FirestorePersistence(
+            firestore_client=firestore_client,
+            store_user_data=True,  # Essential for conversation user data
+            store_chat_data=False, # Usually not needed for chat-specific data in this bot
+            store_bot_data=True,   # Useful for bot-wide data like our group_info bridge
+            collection_name="userBotStates" # Using your defined collection name
+        )
+        logger.info("Using FirestorePersistence with collection 'userBotStates'.")
+    except Exception as e_fs:
+        logger.error(f"Failed to initialize Firestore client or persistence: {e_fs}. CONVERSATIONS WILL LIKELY FAIL.", exc_info=True)
+        persistence = None # Fallback to no persistence on error
     # --- End Persistence Setup ---
 
     if BOT_TOKEN:
@@ -82,9 +89,9 @@ try:
         # --- Add Persistence to Builder if configured ---
         if persistence:
             builder.persistence(persistence)
-            logger.info("Persistence layer added to ApplicationBuilder.")
+            logger.info("FirestorePersistence layer added to ApplicationBuilder.")
         else:
-            logger.warning("!!! Persistence layer NOT configured. Conversation state WILL be lost between GCF invocations. Expect intermittent failures. !!!")
+            logger.critical("!!! Persistence layer NOT configured or failed to initialize. Conversation state WILL be lost. THIS IS A CRITICAL ISSUE FOR GCF. !!!")
         # --- End Add Persistence ---
 
         application = builder.build()
@@ -104,43 +111,41 @@ except Exception as e:
     application = None
     bot = None
 
-# --- Crash Fast if Bot Init Fails ---
+# --- Crash Fast if Bot Init Fails (or persistence fails and is critical) ---
 if application is None:
     logger.critical("❌ Application object is None after initialization block. Raising RuntimeError.")
     raise RuntimeError("❌ Application failed to initialize. Telegram bot cannot start without handlers.")
+# If persistence is absolutely critical and failed, you might choose to raise an error here too.
+# For now, it logs a critical warning but attempts to continue without persistence.
 # --- End Crash Fast ---
 
 
 # === Conversation Handler Functions ===
 
-# --- Workaround Function for Lost State ---
+# --- Workaround Function for Lost State (Less likely with persistence, but good fallback) ---
 async def handle_unexpected_state(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handles inputs received when the conversation state is likely lost."""
     user = update.effective_user
     update_type = "Unknown"
     if update.message: update_type = "Message"
     elif update.callback_query: update_type = "CallbackQuery"
 
-    # Log State Data
     user_data_str = pprint.pformat(context.user_data)
     bot_data_str = pprint.pformat(context.bot_data)
     logger.warning(
         f"handle_unexpected_state triggered for User {user.id} (type: {update_type}).\n"
-        f"Likely due to lost state (NO PERSISTENCE?).\n"
+        f"This might indicate an issue OR user sending unexpected input.\n"
         f"Current user_data: {user_data_str}\n"
         f"Current bot_data: {bot_data_str}"
     )
 
-    # Prepare and Escape Debug Info
     max_len = 300
     user_data_preview = user_data_str[:max_len] + ('...' if len(user_data_str) > max_len else '')
     escaped_user_data_preview = escape_markdown(user_data_preview, version=2)
     escaped_update_type = escape_markdown(update_type, version=2)
 
-    # Modified Error Message with Escaped Data
     message_text = (
-        "Sorry, something went wrong and I lost track of our conversation\. 🤔\n"
-        "Please restart the process using /cancel then doing a /newbuy from the group chat again\.\n\n"
+        "Sorry, something unexpected happened or I lost track of our conversation\. 🤔\n"
+        "Please restart the process using /newbuy if you were in the middle of setup\.\n\n"
         f"*Debug Info:*\nReceived: {escaped_update_type}\.\nCurrent user data:\n`{escaped_user_data_preview}`"
     )
 
@@ -154,7 +159,7 @@ async def handle_unexpected_state(update: Update, context: ContextTypes.DEFAULT_
     except TelegramError as e_tele:
          logger.error(f"Error sending unexpected state message (TelegramError): {e_tele}", exc_info=True)
          try:
-             simple_error = "Sorry, something went wrong and I lost track. Please use /newbuy to restart."
+             simple_error = "Sorry, something went wrong. Please use /newbuy to restart."
              if update.callback_query and update.callback_query.message:
                  await update.callback_query.edit_message_text(simple_error)
              elif update.message:
@@ -164,7 +169,7 @@ async def handle_unexpected_state(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.error(f"Error sending unexpected state message: {e}", exc_info=True)
 
-    context.user_data.clear() # Clear any potentially inconsistent data
+    context.user_data.clear()
     logger.info("Ending conversation via handle_unexpected_state.")
     return ConversationHandler.END
 
@@ -172,10 +177,12 @@ async def handle_unexpected_state(update: Update, context: ContextTypes.DEFAULT_
 async def newbuy_start_dm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     logger.info(f"ENTRY POINT: newbuy_start_dm called by User {user.id} ({user.username}).")
-    context.user_data.clear() # Clear data at the start
+    # With persistence, user_data is loaded. Clear it for a fresh start.
+    context.user_data.clear()
+    # Ensure group-specific keys are not present if starting fresh in DM
     context.user_data.pop('group_chat_id', None)
     context.user_data.pop('group_name', None)
-    logger.info(f"User_data at start of newbuy_start_dm: {context.user_data}")
+    logger.info(f"User_data at start of newbuy_start_dm (after clear): {context.user_data}")
     try:
         await update.message.reply_text(
             "Let's set up your group buy!\n\n"
@@ -198,18 +205,22 @@ async def start_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.info(f"ENTRY POINT: start_setup_callback called by User {user.id} ({user.username}). Callback data: {query.data}")
     except Exception as e_ans:
          logger.error(f"Error answering callback query in start_setup_callback: {e_ans}", exc_info=True)
+
+    # Retrieve group info from bot_data (now persistent) and put it in user_data
     group_info_key = f'group_info_{user.id}'
-    group_info = context.bot_data.pop(group_info_key, None)
-    context.user_data.clear() # Clear data before starting
+    group_info = context.bot_data.pop(group_info_key, None) # Retrieve and remove
+
+    context.user_data.clear() # Clear user_data before starting this specific conversation flow
     if group_info:
         context.user_data['group_chat_id'] = group_info.get('group_chat_id')
         context.user_data['group_name'] = group_info.get('group_name')
         logger.info(f"Retrieved and stored group info in user_data: {group_info}")
     else:
-        logger.warning(f"Could not find temporary group info in bot_data for user {user.id} with key {group_info_key}. Starting setup without group context (NO PERSISTENCE?).")
+        logger.warning(f"Could not find group info in bot_data for user {user.id} with key {group_info_key}. Starting setup without group context.")
         context.user_data.pop('group_chat_id', None)
         context.user_data.pop('group_name', None)
     logger.info(f"User_data at start of start_setup_callback (after potential update): {context.user_data}")
+
     try:
         logger.info("Attempting to edit message in start_setup_callback...")
         await query.edit_message_text(
@@ -231,6 +242,8 @@ async def start_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
 
 # --- Subsequent Conversation States ---
+# ... (Keep all functions from received_item to received_confirmation the same as before,
+#      ensuring they use context.user_data for storing and retrieving information) ...
 async def received_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     logger.info(f"STATE HANDLER: received_item entered for User {user.id}. User data: {context.user_data}")
@@ -525,10 +538,18 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Cancels the entire conversation via /cancel command."""
     user = update.effective_user
     logger.info(f"FALLBACK: cancel_conversation entered for User {user.id}.")
-    if update.message: await update.message.reply_text("Okay, the group buy setup has been cancelled.")
-    elif update.callback_query:
-        await update.callback_query.edit_message_text("Okay, the group buy setup has been cancelled.")
-        await update.callback_query.answer()
+    try:
+        if update.message:
+            await update.message.reply_text("Okay, the group buy setup has been cancelled.")
+        elif update.callback_query:
+            if update.callback_query.message: # Ensure message exists to edit
+                await update.callback_query.edit_message_text("Okay, the group buy setup has been cancelled.")
+            await update.callback_query.answer() # Answer callback regardless
+        else:
+             logger.warning("cancel_conversation called with neither message nor callback_query.")
+    except Exception as e:
+        logger.error(f"Error sending/editing cancel confirmation message: {e}", exc_info=True)
+
     context.user_data.clear()
     logger.info("Ending conversation via /cancel. Returning ConversationHandler.END")
     return ConversationHandler.END
@@ -541,7 +562,7 @@ async def newbuy_command_group(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.effective_user
     logger.info(f"Processing /newbuy command from group {chat.id} (type: {chat.type}) by user {user.id} ({user.username})")
     # --- Clear user_data when starting from group ---
-    context.user_data.clear()
+    context.user_data.clear() # Ensure a clean slate for this user's data before DM bridge
     logger.info(f"Cleared user_data for user {user.id} at start of newbuy_command_group.")
     # ---
     group_chat_id = chat.id
@@ -550,6 +571,7 @@ async def newbuy_command_group(update: Update, context: ContextTypes.DEFAULT_TYP
     bot_username = context.bot.username
     temp_group_info = {'group_chat_id': group_chat_id, 'group_name': chat.title if chat.title else "this group"}
     group_info_key = f'group_info_{user_id}'
+    # bot_data is persistent if persistence is configured for it
     context.bot_data[group_info_key] = temp_group_info
     logger.info(f"Stored temporary group info for user {user.id} in bot_data (key: {group_info_key}): {temp_group_info}")
     dm_text = (f"Hi {user.first_name}! You started a new group buy in '{temp_group_info['group_name']}'.\n\nClick the button below to start setting it up here.")
@@ -587,18 +609,22 @@ async def _async_logic_ext(update_data):
         elif update_obj.callback_query: update_type = "CallbackQuery"
         elif update_obj.inline_query: update_type = "InlineQuery"
         logger.info(f"Update object created. Type: {update_type}, Update ID: {update_obj.update_id}")
-        # --- Add Logging Around process_update ---
         user_id = update_obj.effective_user.id if update_obj.effective_user else "N/A"
-        # logger.info(f"User data BEFORE process_update for user {user_id}: {context.user_data if context else 'N/A'}") # Can't access context here
-        # ---
         async with application:
+            # Log user_data BEFORE processing if persistence is on (it would be loaded)
+            # if application.persistence:
+            #    loaded_user_data = await application.persistence.get_user_data()
+            #    logger.info(f"User data BEFORE process_update for user {user_id} (from persistence): {loaded_user_data.get(user_id, {})}")
+
             await application.process_update(update_obj)
-        # --- Add Logging Around process_update ---
-        # logger.info(f"User data AFTER process_update for user {user_id}: {context.user_data if context else 'N/A'}") # Can't access context here
-        # ---
+
+            # Log user_data AFTER processing if persistence is on (it would be updated)
+            # if application.persistence:
+            #    updated_user_data = await application.persistence.get_user_data()
+            #    logger.info(f"User data AFTER process_update for user {user_id} (from persistence): {updated_user_data.get(user_id, {})}")
         logger.info("--- Application processed update successfully ---")
     except Exception as e:
-        logger.error(f"!!! ERROR during application.process_update: {e} !!!", exc_info=True) # Log error here
+        logger.error(f"!!! ERROR during application.process_update: {e} !!!", exc_info=True)
     finally:
         logger.info("--- _async_logic_ext finished ---")
         return "ok", 200
@@ -640,7 +666,6 @@ if application:
             CallbackQueryHandler(start_setup_callback, pattern='^start_setup$')
         ],
         states={
-            # --- REMOVED handle_unexpected_state from states ---
             ASKING_ITEM: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_item)],
             ASKING_IMAGE_CHOICE: [CallbackQueryHandler(received_image_choice, pattern='^img_(upload|skip)$')],
             HANDLE_IMAGE_UPLOAD: [
@@ -662,11 +687,10 @@ if application:
         },
         fallbacks=[
             CommandHandler("cancel", cancel_conversation),
-            # --- Add a fallback for ANY message/callback in the conversation ---
             MessageHandler(filters.ALL, handle_unexpected_state),
             CallbackQueryHandler(handle_unexpected_state)
             ],
-        name="newbuy_conversation", # Name is required if using persistence
+        name="newbuy_conversation", # Name is required for persistence
         # persistent=True, # Enable if persistence object is configured above
     )
     application.add_handler(conv_handler)
