@@ -1,0 +1,5 @@
+python-telegram-bot>=20.0 
+requests>=2.0
+httpx
+nest_asyncio
+google-cloud-firestore>=2.0.0
