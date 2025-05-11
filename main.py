@@ -7,7 +7,9 @@ import uuid # For generating unique IDs
 import json # For handling callback data
 import pprint # For pretty printing dictionaries in logs/messages
 import re # Import regex for escaping
-from typing import Any, Dict, Optional, Tuple, Set, cast # For type hinting
+from typing import Any, Dict, Optional, Tuple, Set, cast, DefaultDict # For type hinting
+from collections import defaultdict # For get_user_data, get_chat_data
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 # Import the error class for handling DM failures
 from telegram.error import Forbidden, TelegramError
@@ -40,6 +42,11 @@ logging.getLogger("httpx").setLevel(logging.WARNING) # Reduce httpx noise
 logger = logging.getLogger(__name__)
 
 print("--- main.py loaded ---")
+try:
+    logger.info(f"Global scope: Current loop ID from get_event_loop: {id(asyncio.get_event_loop())}")
+except RuntimeError:
+    logger.info("Global scope: No current event loop from get_event_loop initially.")
+
 
 # --- Define Conversation States ---
 # Using integers for states
@@ -48,60 +55,49 @@ print("--- main.py loaded ---")
  ASKING_PAYMENT_DETAILS, ASKING_CONFIRMATION, HANDLE_IMAGE_UPLOAD) = range(10)
 
 
-# === Custom Firestore Persistence Class (Skeleton) ===
+# === Custom Firestore Persistence Class ===
 class CustomFirestorePersistence(BasePersistence):
     """
-    A custom persistence class for python-telegram-bot using Google Firestore.
-    This is a SKELETON and needs its methods to be fully implemented.
+    A custom persistence class for python-telegram-bot using Google Firestore,
+    aligned with the user's specified collection structure.
     """
     def __init__(
         self,
         firestore_client: firestore.AsyncClient,
-        collection_name: str = "telegram_bot_persistence", # Main collection for this bot's persistence
+        # These collection names should match your Firestore setup
+        user_bot_states_collection: str = "userBotStates",
+        bot_data_collection: str = "telegramBotGlobalData", # For bot_data
         store_user_data: bool = True,
-        store_chat_data: bool = True, # Set to False if not using chat_data
+        store_chat_data: bool = False, # Not implementing chat_data for now
         store_bot_data: bool = True,
     ):
-        # --- FIX: Call super().__init__() without arguments ---
-        super().__init__()
-        # --- End FIX ---
-
-        # Store these flags as instance attributes
+        super().__init__() # Call super init without args for PTB v20+
         self.store_user_data = store_user_data
         self.store_chat_data = store_chat_data
         self.store_bot_data = store_bot_data
-        # ---
-
         self.firestore_client = firestore_client
-        # Main top-level collection for all persistence data of this bot
-        self.root_collection_name = collection_name
 
-        # Define sub-collection names or specific document IDs under the root collection
-        self._bot_data_doc_id = "bot_data_storage" # Document ID for bot_data
-        self._user_data_subcollection = "user_data" # Sub-collection for user_data
-        self._chat_data_subcollection = "chat_data" # Sub-collection for chat_data
-        self._conversations_subcollection = "conversations" # Sub-collection for conversations
+        self.user_bot_states_collection_name = user_bot_states_collection
+        self.bot_data_collection_name = bot_data_collection
+        self._bot_data_doc_id = "shared_bot_data" # Single document for all bot_data
 
-        logger.info(f"CustomFirestorePersistence initialized. Root collection: '{self.root_collection_name}'.")
-        if not self.store_user_data:
-            logger.warning("CustomFirestorePersistence: store_user_data is False. User data will not be persisted by this instance.")
-        if not self.store_chat_data:
-            logger.warning("CustomFirestorePersistence: store_chat_data is False. Chat data will not be persisted by this instance.")
-        if not self.store_bot_data:
-            logger.warning("CustomFirestorePersistence: store_bot_data is False. Bot data will not be persisted by this instance.")
+        logger.info(f"CustomFirestorePersistence initialized. User/Conv states in: '{user_bot_states_collection}'. Bot data in: '{bot_data_collection}/{self._bot_data_doc_id}'.")
+        if not self.store_user_data: logger.warning("CustomFirestorePersistence: store_user_data is False.")
+        if not self.store_chat_data: logger.warning("CustomFirestorePersistence: store_chat_data is False (and not implemented).")
+        if not self.store_bot_data: logger.warning("CustomFirestorePersistence: store_bot_data is False.")
 
 
     async def get_bot_data(self) -> Dict[Any, Any]:
-        """Retrieves bot_data from Firestore."""
         if not self.store_bot_data:
             return {}
         try:
-            doc_ref = self.firestore_client.collection(self.root_collection_name).document(self._bot_data_doc_id)
+            # logger.info(f"get_bot_data: Current loop ID: {id(asyncio.get_running_loop())}")
+            doc_ref = self.firestore_client.collection(self.bot_data_collection_name).document(self._bot_data_doc_id)
             doc_snapshot = await doc_ref.get()
             if doc_snapshot.exists:
                 data = doc_snapshot.to_dict()
-                logger.debug(f"CustomFirestorePersistence: get_bot_data retrieved: {data}")
-                return data if data else {} 
+                logger.debug(f"CustomFirestorePersistence: get_bot_data retrieved: {pprint.pformat(data)}")
+                return data if data else {}
             logger.debug("CustomFirestorePersistence: get_bot_data - bot_data document not found.")
             return {}
         except Exception as e:
@@ -109,103 +105,187 @@ class CustomFirestorePersistence(BasePersistence):
             return {}
 
     async def update_bot_data(self, data: Dict[Any, Any]) -> None:
-        """Updates bot_data in Firestore."""
         if not self.store_bot_data:
             return
         try:
-            logger.debug(f"CustomFirestorePersistence: update_bot_data called with data: {data}")
-            doc_ref = self.firestore_client.collection(self.root_collection_name).document(self._bot_data_doc_id)
-            await doc_ref.set(data, merge=False) 
+            # logger.info(f"update_bot_data: Current loop ID: {id(asyncio.get_running_loop())}")
+            logger.debug(f"CustomFirestorePersistence: update_bot_data with: {pprint.pformat(data)}")
+            doc_ref = self.firestore_client.collection(self.bot_data_collection_name).document(self._bot_data_doc_id)
+            if not data:
+                logger.info(f"CustomFirestorePersistence: Setting bot_data to empty map as data is empty.")
+                await doc_ref.set({}) # Store empty map
+            else:
+                await doc_ref.set(data) # Overwrite with new bot_data state
             logger.debug(f"CustomFirestorePersistence: update_bot_data - bot_data updated.")
         except Exception as e:
             logger.error(f"CustomFirestorePersistence: Error in update_bot_data: {e}", exc_info=True)
 
-    async def get_user_data(self) -> Dict[int, Dict[Any, Any]]:
-        """Retrieves all user_data from Firestore."""
+    async def get_user_data(self) -> DefaultDict[int, Dict[Any, Any]]:
+        """Retrieves all user_data (pendingData field) from userBotStates collection."""
         if not self.store_user_data:
-            return {}
-        all_user_data: Dict[int, Dict[Any, Any]] = {}
+            return defaultdict(dict)
+        all_user_data: DefaultDict[int, Dict[Any, Any]] = defaultdict(dict)
         try:
-            logger.debug(f"CustomFirestorePersistence: get_user_data called. Fetching from subcollection '{self._user_data_subcollection}'.")
-            users_coll_ref = self.firestore_client.collection(self.root_collection_name).document(self._user_data_subcollection).collection("users")
+            # logger.info(f"get_user_data: Current loop ID: {id(asyncio.get_running_loop())}")
+            logger.debug(f"CustomFirestorePersistence: get_user_data called. Fetching from '{self.user_bot_states_collection_name}'.")
+            users_coll_ref = self.firestore_client.collection(self.user_bot_states_collection_name)
             async for doc_snapshot in users_coll_ref.stream():
                 try:
-                    user_id = int(doc_snapshot.id)
-                    user_data_content = doc_snapshot.to_dict()
-                    if user_data_content is not None: 
-                         all_user_data[user_id] = user_data_content
-                    else:
-                        logger.warning(f"CustomFirestorePersistence: User data document {doc_snapshot.id} is empty or malformed.")
+                    user_id_str = doc_snapshot.id
+                    user_id = int(user_id_str) 
+                    
+                    doc_data = doc_snapshot.to_dict()
+                    if doc_data and 'pendingData' in doc_data and isinstance(doc_data['pendingData'], dict):
+                         all_user_data[user_id] = doc_data['pendingData']
+                    elif doc_data and 'pendingData' not in doc_data: # User doc exists but no pendingData field
+                         all_user_data[user_id] = {} # Return empty dict for this user
+                    # If doc_data is None (doc doesn't exist, though stream shouldn't yield it), it's fine, defaultdict handles.
                 except ValueError:
-                    logger.warning(f"CustomFirestorePersistence: Skipping user_data document with non-integer ID: {doc_snapshot.id}")
+                    logger.warning(f"CustomFirestorePersistence: Skipping UserBotStates document with non-integer convertible ID: {doc_snapshot.id}")
                 except Exception as e_doc:
-                    logger.error(f"CustomFirestorePersistence: Error processing user_data document {doc_snapshot.id}: {e_doc}", exc_info=True)
-            logger.debug(f"CustomFirestorePersistence: get_user_data retrieved {len(all_user_data)} users.")
+                    logger.error(f"CustomFirestorePersistence: Error processing UserBotStates document {doc_snapshot.id}: {e_doc}", exc_info=True)
+            logger.debug(f"CustomFirestorePersistence: get_user_data retrieved data for {len(all_user_data)} users.")
             return all_user_data
         except Exception as e:
             logger.error(f"CustomFirestorePersistence: Error in get_user_data: {e}", exc_info=True)
-            return {} 
+            return defaultdict(dict)
 
     async def update_user_data(self, user_id: int, data: Dict[Any, Any]) -> None:
-        """Updates user_data for a specific user_id in Firestore."""
+        """Updates the pendingData field for a specific user_id in userBotStates."""
         if not self.store_user_data:
             return
         try:
-            logger.debug(f"CustomFirestorePersistence: update_user_data for user_id {user_id}. Data keys: {list(data.keys()) if data else 'EMPTY'}")
-            doc_ref = self.firestore_client.collection(self.root_collection_name).document(self._user_data_subcollection).collection("users").document(str(user_id))
+            # logger.info(f"update_user_data: Current loop ID: {id(asyncio.get_running_loop())}")
+            user_id_str = str(user_id)
+            logger.debug(f"CustomFirestorePersistence: update_user_data for user_id {user_id_str}. Data keys: {list(data.keys()) if data else 'EMPTY'}")
+            doc_ref = self.firestore_client.collection(self.user_bot_states_collection_name).document(user_id_str)
+            
+            update_payload: Dict[str, Any] = {'telegramUserId': user_id} 
             if not data: 
-                logger.info(f"CustomFirestorePersistence: Deleting user_data for user_id {user_id} as data is empty.")
-                await doc_ref.delete()
+                logger.info(f"CustomFirestorePersistence: Setting pendingData to empty for user_id {user_id_str} as data is empty.")
+                update_payload['pendingData'] = {}
             else:
-                await doc_ref.set(data, merge=False) 
-            logger.debug(f"CustomFirestorePersistence: user_data for user_id {user_id} updated/deleted.")
+                update_payload['pendingData'] = data
+            
+            await doc_ref.set(update_payload, merge=True)
+            logger.debug(f"CustomFirestorePersistence: user_data (pendingData) for user_id {user_id_str} updated.")
         except Exception as e:
             logger.error(f"CustomFirestorePersistence: Error in update_user_data for user_id {user_id}: {e}", exc_info=True)
 
-    async def get_chat_data(self) -> Dict[int, Dict[Any, Any]]:
-        """SKELETON - NOT IMPLEMENTED"""
-        if not self.store_chat_data: return {}
+    async def get_chat_data(self) -> DefaultDict[int, Dict[Any, Any]]:
+        if not self.store_chat_data: return defaultdict(dict)
         logger.warning("CustomFirestorePersistence: get_chat_data (SKELETON - NOT IMPLEMENTED)")
-        return {}
+        return defaultdict(dict)
 
     async def update_chat_data(self, chat_id: int, data: Dict[Any, Any]) -> None:
-        """SKELETON - NOT IMPLEMENTED"""
         if not self.store_chat_data: return
         logger.warning(f"CustomFirestorePersistence: update_chat_data for chat_id {chat_id} (SKELETON - NOT IMPLEMENTED)")
         pass
 
     async def get_conversations(self, name: str) -> Dict[Tuple[int, ...], Any]:
-        """Retrieves conversation states for a given conversation name. SKELETON - NOT IMPLEMENTED."""
-        logger.warning(f"CustomFirestorePersistence: get_conversations for name '{name}' (SKELETON - NOT IMPLEMENTED)")
-        return {}
+        """Retrieves conversation states (currentState field) from userBotStates."""
+        logger.debug(f"CustomFirestorePersistence: get_conversations for name '{name}' called.")
+        conversations: Dict[Tuple[int, ...], Any] = {}
+        try:
+            # logger.info(f"get_conversations: Current loop ID: {id(asyncio.get_running_loop())}")
+            user_states_coll_ref = self.firestore_client.collection(self.user_bot_states_collection_name)
+            async for doc_snapshot in user_states_coll_ref.stream():
+                try:
+                    user_id_str = doc_snapshot.id
+                    user_id = int(user_id_str)
+                    doc_data = doc_snapshot.to_dict()
+                    if doc_data and 'currentState' in doc_data:
+                        # For DM conversations, PTB key is typically (user_id,)
+                        conv_key = (user_id,) 
+                        conversations[conv_key] = doc_data['currentState']
+                except ValueError:
+                    logger.warning(f"CustomFirestorePersistence: Skipping UserBotStates document for conversations with non-integer ID: {doc_snapshot.id}")
+                except Exception as e_doc:
+                    logger.error(f"Error processing UserBotStates document {doc_snapshot.id} for conversations '{name}': {e_doc}", exc_info=True)
+            logger.debug(f"CustomFirestorePersistence: get_conversations for '{name}' retrieved {len(conversations)} entries.")
+            return conversations
+        except Exception as e:
+            logger.error(f"CustomFirestorePersistence: Error in get_conversations for '{name}': {e}", exc_info=True)
+            return {}
 
     async def update_conversation(
         self, name: str, key: Tuple[int, ...], new_state: Optional[object]
     ) -> None:
-        """Updates the state for a specific conversation. SKELETON - NOT IMPLEMENTED."""
-        key_str = "_".join(map(str, key)) 
-        logger.warning(f"CustomFirestorePersistence: update_conversation for name '{name}', key {key} (str: {key_str}), new_state {new_state} (SKELETON - NOT IMPLEMENTED)")
-        pass
+        """Updates the currentState field in userBotStates for a specific conversation."""
+        if not key:
+            logger.error(f"CustomFirestorePersistence: update_conversation called with empty key for name '{name}'.")
+            return
+        
+        user_id = key[0] 
+        user_id_str = str(user_id)
+        
+        logger.debug(f"CustomFirestorePersistence: update_conversation for name '{name}', user_id {user_id_str}, new_state {new_state}")
+        try:
+            # logger.info(f"update_conversation: Current loop ID: {id(asyncio.get_running_loop())}")
+            doc_ref = self.firestore_client.collection(self.user_bot_states_collection_name).document(user_id_str)
+            update_payload: Dict[str, Any] = {'telegramUserId': user_id} # Ensure telegramUserId is always part of the payload
+            if new_state is None:
+                logger.info(f"CustomFirestorePersistence: Setting currentState to None for user {user_id_str}, conversation '{name}'.")
+                # To remove a field, you might set it to None or use firestore.DELETE_FIELD
+                # However, to ensure the document exists for other data like pendingData,
+                # we'll set currentState to None.
+                update_payload['currentState'] = None 
+            else:
+                update_payload['currentState'] = new_state
+            
+            await doc_ref.set(update_payload, merge=True) 
+            logger.debug(f"CustomFirestorePersistence: Conversation state for '{name}', user {user_id_str} updated.")
+        except Exception as e:
+            logger.error(f"CustomFirestorePersistence: Error in update_conversation for '{name}', user {user_id_str}: {e}", exc_info=True)
 
     async def flush(self) -> None:
-        """For Firestore with AsyncClient, writes are generally not buffered in this class."""
-        logger.debug("CustomFirestorePersistence: flush called (typically no-op for direct Firestore writes).")
+        logger.debug("CustomFirestorePersistence: flush called (no-op for this implementation).")
         pass
 
-    # --- New Required Refresh Methods (PTB v20.1+) ---
-    async def refresh_user_data(self, user_id: int, user_data: Dict) -> None:
-        logger.debug(f"CustomFirestorePersistence: refresh_user_data for user_id {user_id} (SKELETON - pass). Current data: {user_data}")
+    async def refresh_user_data(self, user_id: int, user_data: Dict[Any, Any]) -> None:
+        logger.debug(f"CustomFirestorePersistence: refresh_user_data for user_id {user_id}.")
+        if not self.store_user_data:
+            user_data.clear() # Ensure it's empty if not stored
+            return
+        try:
+            # logger.info(f"refresh_user_data: Current loop ID: {id(asyncio.get_running_loop())}")
+            doc_ref = self.firestore_client.collection(self.user_bot_states_collection_name).document(str(user_id))
+            doc_snapshot = await doc_ref.get()
+            user_data.clear() 
+            if doc_snapshot.exists:
+                doc_dict = doc_snapshot.to_dict()
+                if doc_dict and 'pendingData' in doc_dict and isinstance(doc_dict['pendingData'], dict):
+                    user_data.update(doc_dict['pendingData'])
+                    logger.debug(f"Refreshed user_data for {user_id} from Firestore: {user_data}")
+                else:
+                    logger.debug(f"No 'pendingData' found in Firestore for user {user_id} during refresh. user_data remains empty.")
+            else:
+                logger.debug(f"No document found for user {user_id} during refresh_user_data. user_data remains empty.")
+        except Exception as e:
+            logger.error(f"Error in refresh_user_data for user_id {user_id}: {e}", exc_info=True)
+            user_data.clear() # Ensure clean state on error
+
+    async def refresh_chat_data(self, chat_id: int, chat_data: Dict[Any, Any]) -> None:
+        if not self.store_chat_data: chat_data.clear(); return
+        logger.warning(f"CustomFirestorePersistence: refresh_chat_data for chat_id {chat_id} (SKELETON - NOT IMPLEMENTED)")
+        chat_data.clear()
         pass
 
-    async def refresh_chat_data(self, chat_id: int, chat_data: Dict) -> None:
-        logger.debug(f"CustomFirestorePersistence: refresh_chat_data for chat_id {chat_id} (SKELETON - pass). Current data: {chat_data}")
-        pass
-
-    async def refresh_bot_data(self, bot_data: Dict) -> None:
-        logger.debug(f"CustomFirestorePersistence: refresh_bot_data (SKELETON - pass). Current data: {bot_data}")
-        pass
-    # --- End New Refresh Methods ---
-
+    async def refresh_bot_data(self, bot_data: Dict[Any, Any]) -> None:
+        logger.debug(f"CustomFirestorePersistence: refresh_bot_data.")
+        if not self.store_bot_data:
+            bot_data.clear()
+            return
+        try:
+            # logger.info(f"refresh_bot_data: Current loop ID: {id(asyncio.get_running_loop())}")
+            fresh_data = await self.get_bot_data() 
+            bot_data.clear()
+            bot_data.update(fresh_data)
+            logger.debug(f"Refreshed bot_data from Firestore: {bot_data}")
+        except Exception as e:
+            logger.error(f"Error in refresh_bot_data: {e}", exc_info=True)
+            bot_data.clear()
+    
     async def get_callback_data(self) -> Optional[Any]:
         logger.warning("CustomFirestorePersistence: get_callback_data (SKELETON - NOT IMPLEMENTED)")
         return None
@@ -218,9 +298,12 @@ class CustomFirestorePersistence(BasePersistence):
         if not self.store_user_data: return
         logger.info(f"CustomFirestorePersistence: drop_user_data for user_id {user_id}")
         try:
-            doc_ref = self.firestore_client.collection(self.root_collection_name).document(self._user_data_subcollection).collection("users").document(str(user_id))
-            await doc_ref.delete()
-            logger.info(f"CustomFirestorePersistence: Deleted user_data for user_id {user_id}.")
+            doc_ref = self.firestore_client.collection(self.user_bot_states_collection_name).document(str(user_id))
+            # To only remove pendingData and currentState, you might do:
+            # await doc_ref.update({"pendingData": firestore.DELETE_FIELD, "currentState": firestore.DELETE_FIELD})
+            # For simplicity, if dropping user_data means dropping the whole record:
+            await doc_ref.delete() # This deletes the entire document for the user
+            logger.info(f"CustomFirestorePersistence: Deleted UserBotStates document for user_id {user_id}.")
         except Exception as e:
             logger.error(f"CustomFirestorePersistence: Error in drop_user_data for user_id {user_id}: {e}", exc_info=True)
 
@@ -239,19 +322,33 @@ persistence = None # Initialize persistence globally
 try:
     BOT_TOKEN = os.environ['BOT_TOKEN']
     logger.info(f"Attempting init with BOT_TOKEN ending: ...{BOT_TOKEN[-4:] if BOT_TOKEN else 'N/A'}")
+    
+    GCP_PROJECT_ID = os.environ.get('GCP_PROJECT') 
+    FIRESTORE_DATABASE_ID = "garupa-group-buy" 
+
+    if not GCP_PROJECT_ID:
+        logger.error("GCP_PROJECT environment variable not found. Cannot reliably initialize Firestore client.")
+        # For local testing, ensure GOOGLE_APPLICATION_CREDENTIALS is set.
+        # If running locally and it's not set, firestore.AsyncClient() might still work if gcloud auth is set up.
 
     # --- Persistence Setup using CustomFirestorePersistence ---
     try:
-        firestore_client = firestore.AsyncClient()
-        logger.info("Firestore client initialization requested for CustomFirestorePersistence.")
+        if GCP_PROJECT_ID:
+            firestore_client = firestore.AsyncClient(project=GCP_PROJECT_ID, database=FIRESTORE_DATABASE_ID)
+            logger.info(f"Firestore client initialization requested for CustomFirestorePersistence with project ID: {GCP_PROJECT_ID} and database ID: {FIRESTORE_DATABASE_ID}.")
+        else:
+            firestore_client = firestore.AsyncClient(database=FIRESTORE_DATABASE_ID) 
+            logger.info(f"Firestore client initialization requested for CustomFirestorePersistence (project ID inferred from environment) with database ID: {FIRESTORE_DATABASE_ID}.")
+
         persistence = CustomFirestorePersistence(
             firestore_client=firestore_client,
             store_user_data=True,
             store_chat_data=False, 
             store_bot_data=True,   
-            collection_name="telegramBotStates" 
+            user_bot_states_collection="userBotStates", 
+            bot_data_collection="telegramBotGlobalData" 
         )
-        logger.info("Using CustomFirestorePersistence with collection 'telegramBotStates'.")
+        logger.info(f"Using CustomFirestorePersistence. User/Conv states in: '{persistence.user_bot_states_collection_name}', Bot data in: '{persistence.bot_data_collection_name}'.")
     except Exception as e_fs:
         logger.error(f"!!! CRITICAL FAILURE: Failed to initialize Firestore client or CustomFirestorePersistence: {e_fs}. Bot will not function correctly. !!!", exc_info=True)
         persistence = None
@@ -299,7 +396,6 @@ if persistence is None:
 # ... (All conversation state functions: handle_unexpected_state, newbuy_start_dm, start_setup_callback, received_item ... cancel_conversation remain IDENTICAL to your last provided version) ...
 # --- Workaround Function for Lost State (Should be less frequent with persistence) ---
 async def handle_unexpected_state(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handles inputs received when the conversation state is likely lost."""
     user = update.effective_user
     update_type = "Unknown"
     if update.message: update_type = "Message"
@@ -818,12 +914,13 @@ def telegram_webhook(request):
         try:
             update_data = request.get_json(force=True)
             logger.info(f"Received update data (keys): {list(update_data.keys()) if isinstance(update_data, dict) else 'N/A'}")
-            loop = asyncio.get_event_loop()
-            result, status_code = loop.run_until_complete(_async_logic_ext(update_data))
+            # --- Use asyncio.run for cleaner loop management with nest_asyncio ---
+            result, status_code = asyncio.run(_async_logic_ext(update_data))
+            # ---
             logger.info(f"Async logic finished, sync wrapper returning result: '{result}', status: {status_code}")
             return result, status_code
         except Exception as e:
-            logger.critical(f"!!! FATAL ERROR during JSON parsing or run_until_complete: {e} !!!", exc_info=True)
+            logger.critical(f"!!! FATAL ERROR during JSON parsing or run_until_complete/asyncio.run: {e} !!!", exc_info=True)
             return "Internal Server Error", 500
     else:
         logger.warning(f"Received non-POST request ({request.method}), returning Method Not Allowed")
@@ -869,8 +966,7 @@ if application:
             CallbackQueryHandler(handle_unexpected_state)
             ],
         name="newbuy_conversation", # Name is required for persistence
-        persistent=True if persistence else False, # Only enable if persistence object exists
-                                                    # This will be True if CustomFirestorePersistence initializes
+        persistent=True if persistence else False, 
     )
     application.add_handler(conv_handler)
     logger.info(f"Added: Conversation handler for PRIVATE setup (persistent={conv_handler.persistent})")
@@ -884,3 +980,4 @@ if application:
 
 else:
     logger.warning("--- Skipping handler setup because Application initialization failed ---")
+
