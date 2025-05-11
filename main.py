@@ -7,6 +7,7 @@ import uuid # For generating unique IDs
 import json # For handling callback data
 import pprint # For pretty printing dictionaries in logs/messages
 import re # Import regex for escaping
+from typing import Any, Dict, Optional, Tuple, Set, cast # For type hinting
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 # Import the error class for handling DM failures
 from telegram.error import Forbidden, TelegramError
@@ -20,8 +21,8 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler, # Import ConversationHandler
     CallbackQueryHandler, # Import CallbackQueryHandler for buttons
-    # --- Persistence Imports ---
-    FirestorePersistence # For PTB v20+
+    BasePersistence, # Import BasePersistence to create a custom one
+    PersistenceInput # For type hinting in persistence methods
 )
 # Requires google-cloud-firestore to be installed
 from google.cloud import firestore
@@ -46,39 +47,214 @@ print("--- main.py loaded ---")
  ASKING_CLOSING_TIME, ASKING_PICKUP, ASKING_PAYMENT_CHOICE,
  ASKING_PAYMENT_DETAILS, ASKING_CONFIRMATION, HANDLE_IMAGE_UPLOAD) = range(10)
 
+
+# === Custom Firestore Persistence Class (Skeleton) ===
+class CustomFirestorePersistence(BasePersistence):
+    """
+    A custom persistence class for python-telegram-bot using Google Firestore.
+    This is a SKELETON and needs its methods to be fully implemented.
+    """
+    def __init__(
+        self,
+        firestore_client: firestore.AsyncClient,
+        collection_name: str = "telegram_bot_persistence", # Main collection for this bot's persistence
+        store_user_data: bool = True,
+        store_chat_data: bool = True, # Set to False if not using chat_data
+        store_bot_data: bool = True,
+    ):
+        # --- FIX: Call super().__init__() without arguments ---
+        super().__init__()
+        # --- End FIX ---
+
+        # Store these flags as instance attributes
+        self.store_user_data = store_user_data
+        self.store_chat_data = store_chat_data
+        self.store_bot_data = store_bot_data
+        # ---
+
+        self.firestore_client = firestore_client
+        # Main top-level collection for all persistence data of this bot
+        self.root_collection_name = collection_name
+
+        # Define sub-collection names or specific document IDs under the root collection
+        self._bot_data_doc_id = "bot_data_storage" # Document ID for bot_data
+        self._user_data_subcollection = "user_data" # Sub-collection for user_data
+        self._chat_data_subcollection = "chat_data" # Sub-collection for chat_data
+        self._conversations_subcollection = "conversations" # Sub-collection for conversations
+
+        logger.info(f"CustomFirestorePersistence initialized. Root collection: '{self.root_collection_name}'.")
+        if not self.store_user_data:
+            logger.warning("CustomFirestorePersistence: store_user_data is False. User data will not be persisted by this instance.")
+        if not self.store_chat_data:
+            logger.warning("CustomFirestorePersistence: store_chat_data is False. Chat data will not be persisted by this instance.")
+        if not self.store_bot_data:
+            logger.warning("CustomFirestorePersistence: store_bot_data is False. Bot data will not be persisted by this instance.")
+
+
+    async def get_bot_data(self) -> Dict[Any, Any]:
+        """Retrieves bot_data from Firestore."""
+        if not self.store_bot_data:
+            return {}
+        try:
+            doc_ref = self.firestore_client.collection(self.root_collection_name).document(self._bot_data_doc_id)
+            doc_snapshot = await doc_ref.get()
+            if doc_snapshot.exists:
+                data = doc_snapshot.to_dict()
+                logger.debug(f"CustomFirestorePersistence: get_bot_data retrieved: {data}")
+                return data if data else {} 
+            logger.debug("CustomFirestorePersistence: get_bot_data - bot_data document not found.")
+            return {}
+        except Exception as e:
+            logger.error(f"CustomFirestorePersistence: Error in get_bot_data: {e}", exc_info=True)
+            return {}
+
+    async def update_bot_data(self, data: Dict[Any, Any]) -> None:
+        """Updates bot_data in Firestore."""
+        if not self.store_bot_data:
+            return
+        try:
+            logger.debug(f"CustomFirestorePersistence: update_bot_data called with data: {data}")
+            doc_ref = self.firestore_client.collection(self.root_collection_name).document(self._bot_data_doc_id)
+            await doc_ref.set(data, merge=False) 
+            logger.debug(f"CustomFirestorePersistence: update_bot_data - bot_data updated.")
+        except Exception as e:
+            logger.error(f"CustomFirestorePersistence: Error in update_bot_data: {e}", exc_info=True)
+
+    async def get_user_data(self) -> Dict[int, Dict[Any, Any]]:
+        """Retrieves all user_data from Firestore."""
+        if not self.store_user_data:
+            return {}
+        all_user_data: Dict[int, Dict[Any, Any]] = {}
+        try:
+            logger.debug(f"CustomFirestorePersistence: get_user_data called. Fetching from subcollection '{self._user_data_subcollection}'.")
+            users_coll_ref = self.firestore_client.collection(self.root_collection_name).document(self._user_data_subcollection).collection("users")
+            async for doc_snapshot in users_coll_ref.stream():
+                try:
+                    user_id = int(doc_snapshot.id)
+                    user_data_content = doc_snapshot.to_dict()
+                    if user_data_content is not None: 
+                         all_user_data[user_id] = user_data_content
+                    else:
+                        logger.warning(f"CustomFirestorePersistence: User data document {doc_snapshot.id} is empty or malformed.")
+                except ValueError:
+                    logger.warning(f"CustomFirestorePersistence: Skipping user_data document with non-integer ID: {doc_snapshot.id}")
+                except Exception as e_doc:
+                    logger.error(f"CustomFirestorePersistence: Error processing user_data document {doc_snapshot.id}: {e_doc}", exc_info=True)
+            logger.debug(f"CustomFirestorePersistence: get_user_data retrieved {len(all_user_data)} users.")
+            return all_user_data
+        except Exception as e:
+            logger.error(f"CustomFirestorePersistence: Error in get_user_data: {e}", exc_info=True)
+            return {} 
+
+    async def update_user_data(self, user_id: int, data: Dict[Any, Any]) -> None:
+        """Updates user_data for a specific user_id in Firestore."""
+        if not self.store_user_data:
+            return
+        try:
+            logger.debug(f"CustomFirestorePersistence: update_user_data for user_id {user_id}. Data keys: {list(data.keys()) if data else 'EMPTY'}")
+            doc_ref = self.firestore_client.collection(self.root_collection_name).document(self._user_data_subcollection).collection("users").document(str(user_id))
+            if not data: 
+                logger.info(f"CustomFirestorePersistence: Deleting user_data for user_id {user_id} as data is empty.")
+                await doc_ref.delete()
+            else:
+                await doc_ref.set(data, merge=False) 
+            logger.debug(f"CustomFirestorePersistence: user_data for user_id {user_id} updated/deleted.")
+        except Exception as e:
+            logger.error(f"CustomFirestorePersistence: Error in update_user_data for user_id {user_id}: {e}", exc_info=True)
+
+    async def get_chat_data(self) -> Dict[int, Dict[Any, Any]]:
+        """SKELETON - NOT IMPLEMENTED"""
+        if not self.store_chat_data: return {}
+        logger.warning("CustomFirestorePersistence: get_chat_data (SKELETON - NOT IMPLEMENTED)")
+        return {}
+
+    async def update_chat_data(self, chat_id: int, data: Dict[Any, Any]) -> None:
+        """SKELETON - NOT IMPLEMENTED"""
+        if not self.store_chat_data: return
+        logger.warning(f"CustomFirestorePersistence: update_chat_data for chat_id {chat_id} (SKELETON - NOT IMPLEMENTED)")
+        pass
+
+    async def get_conversations(self, name: str) -> Dict[Tuple[int, ...], Any]:
+        """Retrieves conversation states for a given conversation name. SKELETON - NOT IMPLEMENTED."""
+        logger.warning(f"CustomFirestorePersistence: get_conversations for name '{name}' (SKELETON - NOT IMPLEMENTED)")
+        return {}
+
+    async def update_conversation(
+        self, name: str, key: Tuple[int, ...], new_state: Optional[object]
+    ) -> None:
+        """Updates the state for a specific conversation. SKELETON - NOT IMPLEMENTED."""
+        key_str = "_".join(map(str, key)) 
+        logger.warning(f"CustomFirestorePersistence: update_conversation for name '{name}', key {key} (str: {key_str}), new_state {new_state} (SKELETON - NOT IMPLEMENTED)")
+        pass
+
+    async def flush(self) -> None:
+        """For Firestore with AsyncClient, writes are generally not buffered in this class."""
+        logger.debug("CustomFirestorePersistence: flush called (typically no-op for direct Firestore writes).")
+        pass
+
+    # --- New Required Refresh Methods (PTB v20.1+) ---
+    async def refresh_user_data(self, user_id: int, user_data: Dict) -> None:
+        logger.debug(f"CustomFirestorePersistence: refresh_user_data for user_id {user_id} (SKELETON - pass). Current data: {user_data}")
+        pass
+
+    async def refresh_chat_data(self, chat_id: int, chat_data: Dict) -> None:
+        logger.debug(f"CustomFirestorePersistence: refresh_chat_data for chat_id {chat_id} (SKELETON - pass). Current data: {chat_data}")
+        pass
+
+    async def refresh_bot_data(self, bot_data: Dict) -> None:
+        logger.debug(f"CustomFirestorePersistence: refresh_bot_data (SKELETON - pass). Current data: {bot_data}")
+        pass
+    # --- End New Refresh Methods ---
+
+    async def get_callback_data(self) -> Optional[Any]:
+        logger.warning("CustomFirestorePersistence: get_callback_data (SKELETON - NOT IMPLEMENTED)")
+        return None
+
+    async def update_callback_data(self, data: Any) -> None:
+        logger.warning("CustomFirestorePersistence: update_callback_data (SKELETON - NOT IMPLEMENTED)")
+        pass
+
+    async def drop_user_data(self, user_id: int) -> None:
+        if not self.store_user_data: return
+        logger.info(f"CustomFirestorePersistence: drop_user_data for user_id {user_id}")
+        try:
+            doc_ref = self.firestore_client.collection(self.root_collection_name).document(self._user_data_subcollection).collection("users").document(str(user_id))
+            await doc_ref.delete()
+            logger.info(f"CustomFirestorePersistence: Deleted user_data for user_id {user_id}.")
+        except Exception as e:
+            logger.error(f"CustomFirestorePersistence: Error in drop_user_data for user_id {user_id}: {e}", exc_info=True)
+
+    async def drop_chat_data(self, chat_id: int) -> None:
+        if not self.store_chat_data: return
+        logger.warning(f"CustomFirestorePersistence: drop_chat_data for chat_id {chat_id} (SKELETON - NOT IMPLEMENTED)")
+        pass
+
+
 # --- Global variable for the Telegram Application ---
 application = None
 bot = None
+persistence = None # Initialize persistence globally
 
 # --- INITIALIZE BOT USING ApplicationBuilder ---
-# This block runs once per GCF instance startup (cold start)
 try:
     BOT_TOKEN = os.environ['BOT_TOKEN']
     logger.info(f"Attempting init with BOT_TOKEN ending: ...{BOT_TOKEN[-4:] if BOT_TOKEN else 'N/A'}")
 
-    # --- Persistence Setup using Firestore ---
-    persistence = None
+    # --- Persistence Setup using CustomFirestorePersistence ---
     try:
-        # Initialize Firestore client.
-        # For GCF, if Firestore is in the same project, credentials should be handled automatically
-        # by the runtime service account, provided it has "Cloud Datastore User" role or equivalent.
-        # For local testing, ensure GOOGLE_APPLICATION_CREDENTIALS env var is set.
-        firestore_client = firestore.AsyncClient() # Use AsyncClient for async PTB
-        logger.info("Firestore client initialized successfully (or will be on first use).")
-
-        # collection_name can be customized if needed, e.g., "userBotStates"
-        # Default collection name is "ptb_persistence"
-        persistence = FirestorePersistence(
+        firestore_client = firestore.AsyncClient()
+        logger.info("Firestore client initialization requested for CustomFirestorePersistence.")
+        persistence = CustomFirestorePersistence(
             firestore_client=firestore_client,
-            store_user_data=True,  # Essential for conversation user data
-            store_chat_data=False, # Usually not needed for chat-specific data in this bot
-            store_bot_data=True,   # Useful for bot-wide data like our group_info bridge
-            collection_name="userBotStates" # Using your defined collection name
+            store_user_data=True,
+            store_chat_data=False, 
+            store_bot_data=True,   
+            collection_name="telegramBotStates" 
         )
-        logger.info("Using FirestorePersistence with collection 'userBotStates'.")
+        logger.info("Using CustomFirestorePersistence with collection 'telegramBotStates'.")
     except Exception as e_fs:
-        logger.error(f"Failed to initialize Firestore client or persistence: {e_fs}. CONVERSATIONS WILL LIKELY FAIL.", exc_info=True)
-        persistence = None # Fallback to no persistence on error
+        logger.error(f"!!! CRITICAL FAILURE: Failed to initialize Firestore client or CustomFirestorePersistence: {e_fs}. Bot will not function correctly. !!!", exc_info=True)
+        persistence = None
     # --- End Persistence Setup ---
 
     if BOT_TOKEN:
@@ -86,17 +262,15 @@ try:
         builder.pool_timeout(30.0)
         builder.connection_pool_size(200)
 
-        # --- Add Persistence to Builder if configured ---
         if persistence:
             builder.persistence(persistence)
-            logger.info("FirestorePersistence layer added to ApplicationBuilder.")
+            logger.info("CustomFirestorePersistence layer added to ApplicationBuilder.")
         else:
-            logger.critical("!!! Persistence layer NOT configured or failed to initialize. Conversation state WILL be lost. THIS IS A CRITICAL ISSUE FOR GCF. !!!")
-        # --- End Add Persistence ---
+            logger.critical("!!! CRITICAL: Persistence layer IS NONE. Will not be added to ApplicationBuilder. Conversation state WILL BE LOST. !!!")
 
         application = builder.build()
         bot = application.bot
-        logger.info(f"Application initialized successfully (Token ending: ...{BOT_TOKEN[-4:]})")
+        logger.info(f"Application object built successfully (Token ending: ...{BOT_TOKEN[-4:]})")
     else:
         logger.error("Bot init failed: BOT_TOKEN environment variable is empty.")
         application = None
@@ -111,26 +285,28 @@ except Exception as e:
     application = None
     bot = None
 
-# --- Crash Fast if Bot Init Fails (or persistence fails and is critical) ---
+# --- Crash Fast if Bot Init Fails OR Persistence Fails ---
 if application is None:
-    logger.critical("❌ Application object is None after initialization block. Raising RuntimeError.")
-    raise RuntimeError("❌ Application failed to initialize. Telegram bot cannot start without handlers.")
-# If persistence is absolutely critical and failed, you might choose to raise an error here too.
-# For now, it logs a critical warning but attempts to continue without persistence.
+    logger.critical("❌ Application object is None after initialization block. Raising RuntimeError to fail GCF startup.")
+    raise RuntimeError("❌ Application failed to initialize. Telegram bot cannot start.")
+if persistence is None: 
+     logger.critical("❌ CustomFirestorePersistence is None. This is critical for GCF stateful conversations. Raising RuntimeError to fail GCF startup.")
+     raise RuntimeError("❌ CustomFirestorePersistence failed to initialize. Bot cannot maintain conversation state reliably.")
 # --- End Crash Fast ---
 
 
 # === Conversation Handler Functions ===
-
-# --- Workaround Function for Lost State (Less likely with persistence, but good fallback) ---
+# ... (All conversation state functions: handle_unexpected_state, newbuy_start_dm, start_setup_callback, received_item ... cancel_conversation remain IDENTICAL to your last provided version) ...
+# --- Workaround Function for Lost State (Should be less frequent with persistence) ---
 async def handle_unexpected_state(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles inputs received when the conversation state is likely lost."""
     user = update.effective_user
     update_type = "Unknown"
     if update.message: update_type = "Message"
     elif update.callback_query: update_type = "CallbackQuery"
 
     user_data_str = pprint.pformat(context.user_data)
-    bot_data_str = pprint.pformat(context.bot_data)
+    bot_data_str = pprint.pformat(context.bot_data) 
     logger.warning(
         f"handle_unexpected_state triggered for User {user.id} (type: {update_type}).\n"
         f"This might indicate an issue OR user sending unexpected input.\n"
@@ -140,15 +316,18 @@ async def handle_unexpected_state(update: Update, context: ContextTypes.DEFAULT_
 
     max_len = 300
     user_data_preview = user_data_str[:max_len] + ('...' if len(user_data_str) > max_len else '')
+    # Escape for MarkdownV2
     escaped_user_data_preview = escape_markdown(user_data_preview, version=2)
     escaped_update_type = escape_markdown(update_type, version=2)
 
-    message_text = (
-        "Sorry, something unexpected happened or I lost track of our conversation\. 🤔\n"
-        "Please restart the process using /newbuy if you were in the middle of setup\.\n\n"
-        f"*Debug Info:*\nReceived: {escaped_update_type}\.\nCurrent user data:\n`{escaped_user_data_preview}`"
-    )
 
+    # Correctly escape dots for MarkdownV2 in the f-string itself
+    message_text = (
+        "Sorry, something unexpected happened or I lost track of our conversation\\. 🤔\n"
+        "Please restart the process using /newbuy\\.\n\n"
+        f"*Debug Info:*\nReceived: {escaped_update_type}\\.\nCurrent user data:\n`{escaped_user_data_preview}`"
+    )
+    
     try:
         if update.callback_query:
             await update.callback_query.answer()
@@ -169,7 +348,7 @@ async def handle_unexpected_state(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.error(f"Error sending unexpected state message: {e}", exc_info=True)
 
-    context.user_data.clear()
+    context.user_data.clear() # This will now also clear it from Firestore for this user
     logger.info("Ending conversation via handle_unexpected_state.")
     return ConversationHandler.END
 
@@ -177,10 +356,9 @@ async def handle_unexpected_state(update: Update, context: ContextTypes.DEFAULT_
 async def newbuy_start_dm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     logger.info(f"ENTRY POINT: newbuy_start_dm called by User {user.id} ({user.username}).")
-    # With persistence, user_data is loaded. Clear it for a fresh start.
+    # With persistence, user_data is loaded. Clear it for a fresh start for this conversation.
     context.user_data.clear()
-    # Ensure group-specific keys are not present if starting fresh in DM
-    context.user_data.pop('group_chat_id', None)
+    context.user_data.pop('group_chat_id', None) # Ensure these are not carried over if user starts fresh in DM
     context.user_data.pop('group_name', None)
     logger.info(f"User_data at start of newbuy_start_dm (after clear): {context.user_data}")
     try:
@@ -208,7 +386,10 @@ async def start_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # Retrieve group info from bot_data (now persistent) and put it in user_data
     group_info_key = f'group_info_{user.id}'
-    group_info = context.bot_data.pop(group_info_key, None) # Retrieve and remove
+    # Use get() for bot_data as well to avoid KeyError if not found, though pop is fine too.
+    group_info = context.bot_data.get(group_info_key)
+    if group_info:
+        context.bot_data.pop(group_info_key) # Remove after retrieval
 
     context.user_data.clear() # Clear user_data before starting this specific conversation flow
     if group_info:
@@ -241,9 +422,6 @@ async def start_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception as e_send_err: logger.error(f"Error sending error message in start_setup_callback: {e_send_err}")
         return ConversationHandler.END
 
-# --- Subsequent Conversation States ---
-# ... (Keep all functions from received_item to received_confirmation the same as before,
-#      ensuring they use context.user_data for storing and retrieving information) ...
 async def received_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     logger.info(f"STATE HANDLER: received_item entered for User {user.id}. User data: {context.user_data}")
@@ -691,10 +869,12 @@ if application:
             CallbackQueryHandler(handle_unexpected_state)
             ],
         name="newbuy_conversation", # Name is required for persistence
-        # persistent=True, # Enable if persistence object is configured above
+        persistent=True if persistence else False, # Only enable if persistence object exists
+                                                    # This will be True if CustomFirestorePersistence initializes
     )
     application.add_handler(conv_handler)
-    logger.info("Added: Conversation handler for PRIVATE setup")
+    logger.info(f"Added: Conversation handler for PRIVATE setup (persistent={conv_handler.persistent})")
+
 
     # --- Handler Count Logging ---
     logger.info(f"Handler count in application.handlers[0]: {len(application.handlers.get(0, []))}")
