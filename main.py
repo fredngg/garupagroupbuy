@@ -9,6 +9,8 @@ import pprint # For pretty printing dictionaries in logs/messages
 import re # Import regex for escaping
 from typing import Any, Dict, Optional, Tuple, Set, cast, DefaultDict # For type hinting
 from collections import defaultdict # For get_user_data, get_chat_data
+from functools import partial # For use with asyncio.to_thread
+from datetime import timezone # For UTC timestamps
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 # Import the error class for handling DM failures
@@ -27,7 +29,7 @@ from telegram.ext import (
     PersistenceInput # For type hinting in persistence methods
 )
 # Requires google-cloud-firestore to be installed
-from google.cloud import firestore
+from google.cloud import firestore # Using the synchronous client
 # Import escape_markdown helper
 from telegram.helpers import escape_markdown
 
@@ -42,11 +44,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING) # Reduce httpx noise
 logger = logging.getLogger(__name__)
 
 print("--- main.py loaded ---")
-try:
-    logger.info(f"Global scope: Current loop ID from get_event_loop: {id(asyncio.get_event_loop())}")
-except RuntimeError:
-    logger.info("Global scope: No current event loop from get_event_loop initially.")
-
 
 # --- Define Conversation States ---
 # Using integers for states
@@ -58,45 +55,52 @@ except RuntimeError:
 # === Custom Firestore Persistence Class ===
 class CustomFirestorePersistence(BasePersistence):
     """
-    A custom persistence class for python-telegram-bot using Google Firestore,
-    aligned with the user's specified collection structure.
+    A custom persistence class for python-telegram-bot using Google Firestore's
+    synchronous client, with blocking calls offloaded via asyncio.to_thread.
+    Aligned with the user's specified Firestore schema.
     """
     def __init__(
         self,
-        firestore_client: firestore.AsyncClient,
-        # These collection names should match your Firestore setup
+        project_id: Optional[str],
+        database_id: str,
         user_bot_states_collection: str = "userBotStates",
-        bot_data_collection: str = "telegramBotGlobalData", # For bot_data
+        bot_data_collection: str = "telegramBotGlobalData", 
         store_user_data: bool = True,
-        store_chat_data: bool = False, # Not implementing chat_data for now
+        store_chat_data: bool = False, 
         store_bot_data: bool = True,
     ):
-        super().__init__() # Call super init without args for PTB v20+
+        super().__init__()
         self.store_user_data = store_user_data
         self.store_chat_data = store_chat_data
         self.store_bot_data = store_bot_data
-        self.firestore_client = firestore_client
+        
+        try:
+            self.firestore_client = firestore.Client(project=project_id, database=database_id)
+            logger.info(f"Synchronous Firestore client initialized. Project: {self.firestore_client.project}, DB: {database_id}")
+        except Exception as e_client:
+            logger.error(f"Failed to initialize synchronous Firestore Client (DB: {database_id}): {e_client}", exc_info=True)
+            raise 
 
         self.user_bot_states_collection_name = user_bot_states_collection
         self.bot_data_collection_name = bot_data_collection
-        self._bot_data_doc_id = "shared_bot_data" # Single document for all bot_data
+        self._bot_data_doc_id = "shared_bot_data" 
 
-        logger.info(f"CustomFirestorePersistence initialized. User/Conv states in: '{user_bot_states_collection}'. Bot data in: '{bot_data_collection}/{self._bot_data_doc_id}'.")
-        if not self.store_user_data: logger.warning("CustomFirestorePersistence: store_user_data is False.")
-        if not self.store_chat_data: logger.warning("CustomFirestorePersistence: store_chat_data is False (and not implemented).")
-        if not self.store_bot_data: logger.warning("CustomFirestorePersistence: store_bot_data is False.")
+        logger.info(f"CustomFirestorePersistence configured. User/Conv states in: '{user_bot_states_collection}'. Bot data in: '{bot_data_collection}/{self._bot_data_doc_id}'.")
 
+    async def _run_sync(self, func, *args, **kwargs):
+        """Helper to run synchronous Firestore methods in a thread pool."""
+        return await asyncio.to_thread(func, *args, **kwargs)
 
     async def get_bot_data(self) -> Dict[Any, Any]:
-        if not self.store_bot_data:
+        if not self.store_bot_data: 
+            logger.debug("CustomFirestorePersistence: get_bot_data - store_bot_data is False.")
             return {}
         try:
-            # logger.info(f"get_bot_data: Current loop ID: {id(asyncio.get_running_loop())}")
             doc_ref = self.firestore_client.collection(self.bot_data_collection_name).document(self._bot_data_doc_id)
-            doc_snapshot = await doc_ref.get()
+            doc_snapshot = await self._run_sync(doc_ref.get)
             if doc_snapshot.exists:
                 data = doc_snapshot.to_dict()
-                logger.debug(f"CustomFirestorePersistence: get_bot_data retrieved: {pprint.pformat(data)}")
+                logger.debug(f"CustomFirestorePersistence: get_bot_data retrieved {len(data)} keys.")
                 return data if data else {}
             logger.debug("CustomFirestorePersistence: get_bot_data - bot_data document not found.")
             return {}
@@ -105,41 +109,41 @@ class CustomFirestorePersistence(BasePersistence):
             return {}
 
     async def update_bot_data(self, data: Dict[Any, Any]) -> None:
-        if not self.store_bot_data:
+        if not self.store_bot_data: 
+            logger.debug("CustomFirestorePersistence: update_bot_data - store_bot_data is False.")
             return
         try:
-            # logger.info(f"update_bot_data: Current loop ID: {id(asyncio.get_running_loop())}")
-            logger.debug(f"CustomFirestorePersistence: update_bot_data with: {pprint.pformat(data)}")
+            logger.debug(f"CustomFirestorePersistence: update_bot_data with {len(data)} keys.")
             doc_ref = self.firestore_client.collection(self.bot_data_collection_name).document(self._bot_data_doc_id)
-            if not data:
-                logger.info(f"CustomFirestorePersistence: Setting bot_data to empty map as data is empty.")
-                await doc_ref.set({}) # Store empty map
+            payload = data if data else {} 
+            if not data: 
+                 await self._run_sync(doc_ref.set, {}) 
+                 logger.info("CustomFirestorePersistence: bot_data cleared (set to empty map).")
             else:
-                await doc_ref.set(data) # Overwrite with new bot_data state
+                await self._run_sync(doc_ref.set, payload) 
             logger.debug(f"CustomFirestorePersistence: update_bot_data - bot_data updated.")
         except Exception as e:
             logger.error(f"CustomFirestorePersistence: Error in update_bot_data: {e}", exc_info=True)
 
     async def get_user_data(self) -> DefaultDict[int, Dict[Any, Any]]:
-        """Retrieves all user_data (pendingData field) from userBotStates collection."""
-        if not self.store_user_data:
+        if not self.store_user_data: 
+            logger.debug("CustomFirestorePersistence: get_user_data - store_user_data is False.")
             return defaultdict(dict)
         all_user_data: DefaultDict[int, Dict[Any, Any]] = defaultdict(dict)
         try:
-            # logger.info(f"get_user_data: Current loop ID: {id(asyncio.get_running_loop())}")
             logger.debug(f"CustomFirestorePersistence: get_user_data called. Fetching from '{self.user_bot_states_collection_name}'.")
             users_coll_ref = self.firestore_client.collection(self.user_bot_states_collection_name)
-            async for doc_snapshot in users_coll_ref.stream():
+            docs_list = await self._run_sync(list, users_coll_ref.stream())
+
+            for doc_snapshot in docs_list:
                 try:
                     user_id_str = doc_snapshot.id
-                    user_id = int(user_id_str) 
-                    
+                    user_id = int(user_id_str)
                     doc_data = doc_snapshot.to_dict()
                     if doc_data and 'pendingData' in doc_data and isinstance(doc_data['pendingData'], dict):
                          all_user_data[user_id] = doc_data['pendingData']
-                    elif doc_data and 'pendingData' not in doc_data: # User doc exists but no pendingData field
-                         all_user_data[user_id] = {} # Return empty dict for this user
-                    # If doc_data is None (doc doesn't exist, though stream shouldn't yield it), it's fine, defaultdict handles.
+                    elif doc_data: 
+                         all_user_data[user_id] = {} 
                 except ValueError:
                     logger.warning(f"CustomFirestorePersistence: Skipping UserBotStates document with non-integer convertible ID: {doc_snapshot.id}")
                 except Exception as e_doc:
@@ -151,53 +155,40 @@ class CustomFirestorePersistence(BasePersistence):
             return defaultdict(dict)
 
     async def update_user_data(self, user_id: int, data: Dict[Any, Any]) -> None:
-        """Updates the pendingData field for a specific user_id in userBotStates."""
-        if not self.store_user_data:
-            return
+        if not self.store_user_data: return
         try:
-            # logger.info(f"update_user_data: Current loop ID: {id(asyncio.get_running_loop())}")
             user_id_str = str(user_id)
-            logger.debug(f"CustomFirestorePersistence: update_user_data for user_id {user_id_str}. Data keys: {list(data.keys()) if data else 'EMPTY'}")
+            logger.debug(f"CustomFirestorePersistence: update_user_data for user_id {user_id_str}. Has data: {bool(data)}.")
             doc_ref = self.firestore_client.collection(self.user_bot_states_collection_name).document(user_id_str)
             
             update_payload: Dict[str, Any] = {'telegramUserId': user_id} 
             if not data: 
-                logger.info(f"CustomFirestorePersistence: Setting pendingData to empty for user_id {user_id_str} as data is empty.")
                 update_payload['pendingData'] = {}
             else:
                 update_payload['pendingData'] = data
             
-            await doc_ref.set(update_payload, merge=True)
+            await self._run_sync(doc_ref.set, update_payload, merge=True)
             logger.debug(f"CustomFirestorePersistence: user_data (pendingData) for user_id {user_id_str} updated.")
         except Exception as e:
             logger.error(f"CustomFirestorePersistence: Error in update_user_data for user_id {user_id}: {e}", exc_info=True)
 
-    async def get_chat_data(self) -> DefaultDict[int, Dict[Any, Any]]:
-        if not self.store_chat_data: return defaultdict(dict)
-        logger.warning("CustomFirestorePersistence: get_chat_data (SKELETON - NOT IMPLEMENTED)")
-        return defaultdict(dict)
-
-    async def update_chat_data(self, chat_id: int, data: Dict[Any, Any]) -> None:
-        if not self.store_chat_data: return
-        logger.warning(f"CustomFirestorePersistence: update_chat_data for chat_id {chat_id} (SKELETON - NOT IMPLEMENTED)")
-        pass
-
     async def get_conversations(self, name: str) -> Dict[Tuple[int, ...], Any]:
-        """Retrieves conversation states (currentState field) from userBotStates."""
-        logger.debug(f"CustomFirestorePersistence: get_conversations for name '{name}' called.")
+        logger.debug(f"CustomFirestorePersistence: get_conversations for ConversationHandler name '{name}' called.")
         conversations: Dict[Tuple[int, ...], Any] = {}
         try:
-            # logger.info(f"get_conversations: Current loop ID: {id(asyncio.get_running_loop())}")
             user_states_coll_ref = self.firestore_client.collection(self.user_bot_states_collection_name)
-            async for doc_snapshot in user_states_coll_ref.stream():
+            docs_list = await self._run_sync(list, user_states_coll_ref.stream())
+            for doc_snapshot in docs_list:
                 try:
                     user_id_str = doc_snapshot.id
                     user_id = int(user_id_str)
                     doc_data = doc_snapshot.to_dict()
+                    
                     if doc_data and 'currentState' in doc_data:
-                        # For DM conversations, PTB key is typically (user_id,)
                         conv_key = (user_id,) 
-                        conversations[conv_key] = doc_data['currentState']
+                        state_from_db = doc_data['currentState']
+                        conversations[conv_key] = state_from_db 
+                        # logger.debug(f"Loaded conversation state for user {user_id}, key {conv_key}: {state_from_db}") # Can be noisy
                 except ValueError:
                     logger.warning(f"CustomFirestorePersistence: Skipping UserBotStates document for conversations with non-integer ID: {doc_snapshot.id}")
                 except Exception as e_doc:
@@ -211,7 +202,6 @@ class CustomFirestorePersistence(BasePersistence):
     async def update_conversation(
         self, name: str, key: Tuple[int, ...], new_state: Optional[object]
     ) -> None:
-        """Updates the currentState field in userBotStates for a specific conversation."""
         if not key:
             logger.error(f"CustomFirestorePersistence: update_conversation called with empty key for name '{name}'.")
             return
@@ -221,95 +211,83 @@ class CustomFirestorePersistence(BasePersistence):
         
         logger.debug(f"CustomFirestorePersistence: update_conversation for name '{name}', user_id {user_id_str}, new_state {new_state}")
         try:
-            # logger.info(f"update_conversation: Current loop ID: {id(asyncio.get_running_loop())}")
             doc_ref = self.firestore_client.collection(self.user_bot_states_collection_name).document(user_id_str)
-            update_payload: Dict[str, Any] = {'telegramUserId': user_id} # Ensure telegramUserId is always part of the payload
+            
+            update_payload: Dict[str, Any] = {'telegramUserId': user_id}
             if new_state is None:
                 logger.info(f"CustomFirestorePersistence: Setting currentState to None for user {user_id_str}, conversation '{name}'.")
-                # To remove a field, you might set it to None or use firestore.DELETE_FIELD
-                # However, to ensure the document exists for other data like pendingData,
-                # we'll set currentState to None.
                 update_payload['currentState'] = None 
             else:
                 update_payload['currentState'] = new_state
             
-            await doc_ref.set(update_payload, merge=True) 
+            await self._run_sync(doc_ref.set, update_payload, merge=True) 
             logger.debug(f"CustomFirestorePersistence: Conversation state for '{name}', user {user_id_str} updated.")
         except Exception as e:
             logger.error(f"CustomFirestorePersistence: Error in update_conversation for '{name}', user {user_id_str}: {e}", exc_info=True)
 
-    async def flush(self) -> None:
-        logger.debug("CustomFirestorePersistence: flush called (no-op for this implementation).")
-        pass
-
     async def refresh_user_data(self, user_id: int, user_data: Dict[Any, Any]) -> None:
         logger.debug(f"CustomFirestorePersistence: refresh_user_data for user_id {user_id}.")
-        if not self.store_user_data:
-            user_data.clear() # Ensure it's empty if not stored
-            return
+        if not self.store_user_data: user_data.clear(); return
         try:
-            # logger.info(f"refresh_user_data: Current loop ID: {id(asyncio.get_running_loop())}")
             doc_ref = self.firestore_client.collection(self.user_bot_states_collection_name).document(str(user_id))
-            doc_snapshot = await doc_ref.get()
+            doc_snapshot = await self._run_sync(doc_ref.get)
             user_data.clear() 
             if doc_snapshot.exists:
                 doc_dict = doc_snapshot.to_dict()
                 if doc_dict and 'pendingData' in doc_dict and isinstance(doc_dict['pendingData'], dict):
                     user_data.update(doc_dict['pendingData'])
-                    logger.debug(f"Refreshed user_data for {user_id} from Firestore: {user_data}")
-                else:
-                    logger.debug(f"No 'pendingData' found in Firestore for user {user_id} during refresh. user_data remains empty.")
-            else:
-                logger.debug(f"No document found for user {user_id} during refresh_user_data. user_data remains empty.")
+            # else: user_data remains empty
         except Exception as e:
             logger.error(f"Error in refresh_user_data for user_id {user_id}: {e}", exc_info=True)
-            user_data.clear() # Ensure clean state on error
-
-    async def refresh_chat_data(self, chat_id: int, chat_data: Dict[Any, Any]) -> None:
-        if not self.store_chat_data: chat_data.clear(); return
-        logger.warning(f"CustomFirestorePersistence: refresh_chat_data for chat_id {chat_id} (SKELETON - NOT IMPLEMENTED)")
-        chat_data.clear()
-        pass
+            user_data.clear()
 
     async def refresh_bot_data(self, bot_data: Dict[Any, Any]) -> None:
         logger.debug(f"CustomFirestorePersistence: refresh_bot_data.")
-        if not self.store_bot_data:
-            bot_data.clear()
-            return
+        if not self.store_bot_data: bot_data.clear(); return
         try:
-            # logger.info(f"refresh_bot_data: Current loop ID: {id(asyncio.get_running_loop())}")
             fresh_data = await self.get_bot_data() 
             bot_data.clear()
             bot_data.update(fresh_data)
-            logger.debug(f"Refreshed bot_data from Firestore: {bot_data}")
         except Exception as e:
             logger.error(f"Error in refresh_bot_data: {e}", exc_info=True)
             bot_data.clear()
     
-    async def get_callback_data(self) -> Optional[Any]:
-        logger.warning("CustomFirestorePersistence: get_callback_data (SKELETON - NOT IMPLEMENTED)")
-        return None
-
-    async def update_callback_data(self, data: Any) -> None:
-        logger.warning("CustomFirestorePersistence: update_callback_data (SKELETON - NOT IMPLEMENTED)")
-        pass
-
-    async def drop_user_data(self, user_id: int) -> None:
+    async def drop_user_data(self, user_id: int) -> None: 
         if not self.store_user_data: return
-        logger.info(f"CustomFirestorePersistence: drop_user_data for user_id {user_id}")
+        logger.info(f"CustomFirestorePersistence: drop_user_data for user_id {user_id} (clearing pendingData and currentState).")
         try:
             doc_ref = self.firestore_client.collection(self.user_bot_states_collection_name).document(str(user_id))
-            # To only remove pendingData and currentState, you might do:
-            # await doc_ref.update({"pendingData": firestore.DELETE_FIELD, "currentState": firestore.DELETE_FIELD})
-            # For simplicity, if dropping user_data means dropping the whole record:
-            await doc_ref.delete() # This deletes the entire document for the user
-            logger.info(f"CustomFirestorePersistence: Deleted UserBotStates document for user_id {user_id}.")
+            update_payload = {
+                'telegramUserId': user_id, 
+                'pendingData': {}, 
+                'currentState': None
+            }
+            await self._run_sync(doc_ref.set, update_payload, merge=True)
         except Exception as e:
             logger.error(f"CustomFirestorePersistence: Error in drop_user_data for user_id {user_id}: {e}", exc_info=True)
 
+    # --- Skeletons for other BasePersistence methods ---
+    async def get_chat_data(self) -> DefaultDict[int, Dict[Any, Any]]:
+        if not self.store_chat_data: return defaultdict(dict)
+        logger.warning("CustomFirestorePersistence: get_chat_data (SKELETON - NOT IMPLEMENTED)")
+        return defaultdict(dict)
+    async def update_chat_data(self, chat_id: int, data: Dict[Any, Any]) -> None:
+        if not self.store_chat_data: return
+        logger.warning(f"CustomFirestorePersistence: update_chat_data for chat_id {chat_id} (SKELETON - NOT IMPLEMENTED)")
+    async def refresh_chat_data(self, chat_id: int, chat_data: Dict[Any, Any]) -> None:
+        if not self.store_chat_data: chat_data.clear(); return
+        logger.warning(f"CustomFirestorePersistence: refresh_chat_data for chat_id {chat_id} (SKELETON - NOT IMPLEMENTED)")
+        chat_data.clear()
     async def drop_chat_data(self, chat_id: int) -> None:
         if not self.store_chat_data: return
         logger.warning(f"CustomFirestorePersistence: drop_chat_data for chat_id {chat_id} (SKELETON - NOT IMPLEMENTED)")
+    async def get_callback_data(self) -> Optional[Any]: 
+        logger.warning("CustomFirestorePersistence: get_callback_data (SKELETON - NOT IMPLEMENTED - returning None)")
+        return None
+    async def update_callback_data(self, data: Any) -> None: 
+        logger.warning("CustomFirestorePersistence: update_callback_data (SKELETON - NOT IMPLEMENTED - passing)")
+    async def flush(self) -> None:
+        logger.debug("CustomFirestorePersistence: flush called (no-op for sync client with to_thread).")
         pass
 
 
@@ -327,30 +305,22 @@ try:
     FIRESTORE_DATABASE_ID = "garupa-group-buy" 
 
     if not GCP_PROJECT_ID:
-        logger.error("GCP_PROJECT environment variable not found. Cannot reliably initialize Firestore client.")
-        # For local testing, ensure GOOGLE_APPLICATION_CREDENTIALS is set.
-        # If running locally and it's not set, firestore.AsyncClient() might still work if gcloud auth is set up.
+        logger.error("GCP_PROJECT environment variable not found. Firestore client might use default from credentials if GOOGLE_APPLICATION_CREDENTIALS is set for local testing.")
 
     # --- Persistence Setup using CustomFirestorePersistence ---
     try:
-        if GCP_PROJECT_ID:
-            firestore_client = firestore.AsyncClient(project=GCP_PROJECT_ID, database=FIRESTORE_DATABASE_ID)
-            logger.info(f"Firestore client initialization requested for CustomFirestorePersistence with project ID: {GCP_PROJECT_ID} and database ID: {FIRESTORE_DATABASE_ID}.")
-        else:
-            firestore_client = firestore.AsyncClient(database=FIRESTORE_DATABASE_ID) 
-            logger.info(f"Firestore client initialization requested for CustomFirestorePersistence (project ID inferred from environment) with database ID: {FIRESTORE_DATABASE_ID}.")
-
         persistence = CustomFirestorePersistence(
-            firestore_client=firestore_client,
+            project_id=GCP_PROJECT_ID, 
+            database_id=FIRESTORE_DATABASE_ID, 
             store_user_data=True,
             store_chat_data=False, 
             store_bot_data=True,   
             user_bot_states_collection="userBotStates", 
             bot_data_collection="telegramBotGlobalData" 
         )
-        logger.info(f"Using CustomFirestorePersistence. User/Conv states in: '{persistence.user_bot_states_collection_name}', Bot data in: '{persistence.bot_data_collection_name}'.")
+        logger.info(f"CustomFirestorePersistence configured. User/Conv states in: '{persistence.user_bot_states_collection_name}', Bot data in: '{persistence.bot_data_collection_name}'.")
     except Exception as e_fs:
-        logger.error(f"!!! CRITICAL FAILURE: Failed to initialize Firestore client or CustomFirestorePersistence: {e_fs}. Bot will not function correctly. !!!", exc_info=True)
+        logger.error(f"!!! CRITICAL FAILURE: Failed to initialize CustomFirestorePersistence class: {e_fs}. Bot will not function correctly. !!!", exc_info=True)
         persistence = None
     # --- End Persistence Setup ---
 
@@ -741,13 +711,14 @@ async def received_confirmation(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     user = update.effective_user
     choice = query.data
-    user_data = context.user_data
+    user_data = context.user_data # This data is now loaded by persistence
     logger.info(f"STATE HANDLER: received_confirmation entered for User {user.id}. Choice: {choice}. User data: {user_data}")
+
     if choice == 'confirm_post':
         logger.info(f"User {user.id} confirmed posting. User data: {user_data}")
         group_chat_id = user_data.get('group_chat_id')
-        logger.info(f"Value of group_chat_id from user_data: {group_chat_id}")
         item_name = user_data.get('item_name', 'N/A')
+        # ... (rest of the variable assignments)
         image_file_id = user_data.get('image_file_id')
         price = user_data.get('price', 'N/A')
         moq = user_data.get('moq', 'N/A')
@@ -757,8 +728,37 @@ async def received_confirmation(update: Update, context: ContextTypes.DEFAULT_TY
         payment_details = user_data.get('payment_details', 'N/A')
         payment_qr_file_id = user_data.get('payment_qr_file_id')
         organizer_mention = user.mention_html()
+        group_buy_id = str(uuid.uuid4()) 
+
+        firestore_group_buy_data = {
+            'group_id': group_buy_id, 
+            'itemName': item_name,
+            'itemPrice': user_data.get('price_numeric', price), 
+            'currency': user_data.get('currency', 'SGD'),
+            'description': user_data.get('description', ''),
+            'imageFileId': image_file_id,
+            'initiatorUserId': str(user.id),
+            'initiatorUsername': user.username or "",
+            'createdAt': firestore.SERVER_TIMESTAMP,
+            'deadline': closing_time,
+            'status': 'open',
+            'minParticipants': user_data.get('moq_numeric', 0 if str(moq).lower() == 'no moq' else moq),
+            'maxParticipants': user_data.get('max_participants', 0),
+            'currentParticipantCount': 0,
+            'currentQuantityCount': 0,
+            'pickupAddress': pickup,
+            'paymentMethod': payment_method,
+            'paymentDetails': payment_details,
+            'paymentQRFileID': payment_qr_file_id,
+            'telegramGroupChatID': str(group_chat_id) if group_chat_id else None,
+            'telegramGroupName': user_data.get('group_name'),
+            'telegramPostMessageID': None 
+        }
+        firestore_group_buy_data_cleaned = {k: v for k, v in firestore_group_buy_data.items() if v is not None}
+
         post_caption = (
             f"🎉 **New Group Buy!** 🎉\n\n"
+            f"🆔 `{group_buy_id[:8]}`\n" 
             f"**Item:** {item_name}\n"
             f"**Price:** {price}\n"
             f"**MOQ:** {moq}\n"
@@ -767,26 +767,55 @@ async def received_confirmation(update: Update, context: ContextTypes.DEFAULT_TY
             f"**Payment:** {payment_method}"
         )
         if payment_method == 'Digital': post_caption += f" ({payment_details})"
-        post_caption += (f"\n\nOrganized by: {organizer_mention}\n\nReact to join or ask questions below! 👇")
+        post_caption += (f"\n\nOrganized by: {organizer_mention}\n\n👇 Click below to order or see details!")
+
+        order_callback_data = json.dumps({'a': 'order', 'gid': group_buy_id}) 
+        view_callback_data = json.dumps({'a': 'view', 'gid': group_buy_id})
+
+        if len(order_callback_data.encode('utf-8')) > 64 or len(view_callback_data.encode('utf-8')) > 64:
+            logger.error("Callback data for order/view buttons is too long!")
+            post_keyboard = None
+        else:
+            post_keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🛒 Order Now", callback_data=order_callback_data),
+                    InlineKeyboardButton("👀 See Who Ordered", callback_data=view_callback_data),
+                ]
+            ])
+
         if group_chat_id:
-            logger.info(f"Attempting to post group buy to chat ID: {group_chat_id}")
-            post_successful = False
+            logger.info(f"Attempting to post group buy {group_buy_id} to chat ID: {group_chat_id}")
+            sent_message = None
             try:
                 if image_file_id:
-                    logger.info(f"Sending photo {image_file_id} with caption to group {group_chat_id}")
-                    await context.bot.send_photo(chat_id=group_chat_id, photo=image_file_id, caption=post_caption, parse_mode=ParseMode.HTML)
-                    post_successful = True
+                    sent_message = await context.bot.send_photo(
+                        chat_id=group_chat_id, photo=image_file_id, caption=post_caption,
+                        parse_mode=ParseMode.HTML, reply_markup=post_keyboard
+                    )
                 else:
-                    logger.info(f"Sending text message to group {group_chat_id}")
-                    await context.bot.send_message(chat_id=group_chat_id, text=post_caption, parse_mode=ParseMode.HTML)
-                    post_successful = True
+                    sent_message = await context.bot.send_message(
+                        chat_id=group_chat_id, text=post_caption,
+                        parse_mode=ParseMode.HTML, reply_markup=post_keyboard
+                    )
+                
                 if payment_method == 'Digital' and payment_qr_file_id:
-                    logger.info(f"Sending PayNow QR {payment_qr_file_id} to group {group_chat_id}")
-                    await context.bot.send_photo(chat_id=group_chat_id, photo=payment_qr_file_id, caption="PayNow QR for payment.")
-                if post_successful:
-                    await query.edit_message_text(text=f"✅ Done! I've posted the group buy for '{item_name}' in the group.")
-                    logger.info(f"Successfully posted group buy to group {group_chat_id}")
-            except Forbidden:
+                    await context.bot.send_photo(
+                        chat_id=group_chat_id, photo=payment_qr_file_id, caption="PayNow QR for payment."
+                    )
+                
+                if sent_message:
+                    firestore_group_buy_data_cleaned['telegramPostMessageID'] = str(sent_message.message_id)
+                    if await add_group_buy_to_firestore(group_buy_id, firestore_group_buy_data_cleaned, context): 
+                        await query.edit_message_text(text=f"✅ Done! I've posted the group buy for '{item_name}' in the group.")
+                        logger.info(f"Successfully posted and saved group buy {group_buy_id} to group {group_chat_id}")
+                    else:
+                        await query.edit_message_text(text=f"✅ Posted to group, but failed to save details for '{item_name}' to database. Please check logs.")
+                        logger.error(f"Failed to save group buy {group_buy_id} to Firestore after posting.")
+                else:
+                    logger.error(f"Failed to send group buy message to group {group_chat_id}, sent_message is None.")
+                    await query.edit_message_text(text="❌ Error: Could not send the message to the group.")
+
+            except Forbidden: # ... (rest of exception handling)
                 logger.error(f"Forbidden: Failed to post to group {group_chat_id}. Bot might lack permissions or be banned.")
                 await query.edit_message_text(text="❌ Error: I couldn't post to the group. Please ensure I have permission to send messages (and photos if applicable) in that group.")
             except TelegramError as e_post:
@@ -798,6 +827,7 @@ async def received_confirmation(update: Update, context: ContextTypes.DEFAULT_TY
         else:
              await query.edit_message_text(text=f"✅ Setup complete! Group buy for '{item_name}' is ready. (Normally posted to group if started there).")
              logger.info("Group buy setup completed in DM, no group posting needed because group_chat_id was missing.")
+        
         context.user_data.clear()
         logger.info("received_confirmation: Ending conversation after posting/confirming. Returning ConversationHandler.END")
         return ConversationHandler.END
@@ -809,16 +839,15 @@ async def received_confirmation(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancels the entire conversation via /cancel command."""
     user = update.effective_user
     logger.info(f"FALLBACK: cancel_conversation entered for User {user.id}.")
     try:
         if update.message:
             await update.message.reply_text("Okay, the group buy setup has been cancelled.")
         elif update.callback_query:
-            if update.callback_query.message: # Ensure message exists to edit
+            if update.callback_query.message: 
                 await update.callback_query.edit_message_text("Okay, the group buy setup has been cancelled.")
-            await update.callback_query.answer() # Answer callback regardless
+            await update.callback_query.answer() 
         else:
              logger.warning("cancel_conversation called with neither message nor callback_query.")
     except Exception as e:
@@ -830,24 +859,25 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # === Handler for /newbuy in Groups (initiates DM) ===
 async def newbuy_command_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles /newbuy in groups, attempting to start a DM with a button."""
     if not context.bot: logger.error("!!! ERROR in newbuy_command_group: context.bot is not available! !!!"); return
     chat = update.effective_chat
     user = update.effective_user
     logger.info(f"Processing /newbuy command from group {chat.id} (type: {chat.type}) by user {user.id} ({user.username})")
-    # --- Clear user_data when starting from group ---
-    context.user_data.clear() # Ensure a clean slate for this user's data before DM bridge
+    
+    # With persistence, user_data is loaded. Clear it for a fresh start for this user's interaction.
+    context.user_data.clear() 
     logger.info(f"Cleared user_data for user {user.id} at start of newbuy_command_group.")
-    # ---
+    
     group_chat_id = chat.id
     user_id = user.id
     user_mention = user.mention_html()
     bot_username = context.bot.username
     temp_group_info = {'group_chat_id': group_chat_id, 'group_name': chat.title if chat.title else "this group"}
     group_info_key = f'group_info_{user_id}'
-    # bot_data is persistent if persistence is configured for it
-    context.bot_data[group_info_key] = temp_group_info
+    
+    context.bot_data[group_info_key] = temp_group_info # This will be persisted by FirestorePersistence
     logger.info(f"Stored temporary group info for user {user.id} in bot_data (key: {group_info_key}): {temp_group_info}")
+    
     dm_text = (f"Hi {user.first_name}! You started a new group buy in '{temp_group_info['group_name']}'.\n\nClick the button below to start setting it up here.")
     keyboard = [[InlineKeyboardButton("🚀 Start Setup", callback_data='start_setup')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -861,13 +891,56 @@ async def newbuy_command_group(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.info(f"Sent group confirmation (DM success) to {group_chat_id}")
     except Forbidden:
         logger.warning(f"FAILED to send DM to user {user.id} (Forbidden)")
-        context.bot_data.pop(group_info_key, None)
+        context.bot_data.pop(group_info_key, None) # Clean up if DM failed
         await context.bot.send_message(chat_id=group_chat_id, text=group_reply_fail, parse_mode=ParseMode.HTML)
         logger.info(f"Sent group instruction (DM failed) to {group_chat_id}")
     except Exception as e_dm:
         logger.error(f"ERROR sending initial DM to user {user.id}: {e_dm}", exc_info=True)
-        context.bot_data.pop(group_info_key, None)
+        context.bot_data.pop(group_info_key, None) # Clean up
         await context.bot.send_message(chat_id=group_chat_id, text=f"Sorry {user_mention}, an error occurred trying to contact you privately.", parse_mode=ParseMode.HTML)
+
+# --- Function to add Group Buy to Firestore ---
+async def add_group_buy_to_firestore(group_buy_id: str, group_buy_details: Dict[str, Any], context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Adds a new group buy document to the 'groupBuys' collection in Firestore.
+    Uses the firestore_client from the application's persistence object if available.
+    """
+    logger.info(f"Attempting to add group buy {group_buy_id} to Firestore. Details: {pprint.pformat(group_buy_details)}")
+
+    # Get Firestore client from persistence object if it's our custom one
+    firestore_db_client = None
+    # Ensure persistence and its firestore_client attribute exist
+    if application and application.persistence and hasattr(application.persistence, 'firestore_client') and application.persistence.firestore_client:
+        firestore_db_client = application.persistence.firestore_client
+    else:
+        logger.error("add_group_buy_to_firestore: Could not get Firestore client from application.persistence object or it's None.")
+        # As a fallback, try to initialize a new client, but this is not ideal and might have loop issues
+        try:
+            gcp_project = os.environ.get('GCP_PROJECT')
+            db_id = "garupa-group-buy" # Your named database
+            if gcp_project:
+                firestore_db_client = firestore.Client(project=gcp_project, database=db_id) # Use sync client for this helper
+            else:
+                firestore_db_client = firestore.Client(database=db_id)
+            logger.warning("add_group_buy_to_firestore: Initialized a new SYNC Firestore client as it was not found on persistence object.")
+        except Exception as e_fallback_fs:
+            logger.error(f"add_group_buy_to_firestore: Failed to initialize fallback Firestore client: {e_fallback_fs}")
+            return False
+
+    if not firestore_db_client:
+        logger.error("add_group_buy_to_firestore: Firestore client is not available.")
+        return False
+
+    try:
+        doc_ref = firestore_db_client.collection("groupBuys").document(group_buy_id)
+        # CustomFirestorePersistence uses a sync client, so Firestore operations need to be run in a thread
+        await asyncio.to_thread(doc_ref.set, group_buy_details)
+        logger.info(f"Successfully added group buy {group_buy_id} to Firestore collection 'groupBuys'.")
+        return True
+    except Exception as e:
+        logger.error(f"Error adding group buy {group_buy_id} to Firestore: {e}", exc_info=True)
+        return False
+
 
 # --- Asynchronous Logic to Process Updates ---
 async def _async_logic_ext(update_data):
@@ -884,18 +957,8 @@ async def _async_logic_ext(update_data):
         elif update_obj.inline_query: update_type = "InlineQuery"
         logger.info(f"Update object created. Type: {update_type}, Update ID: {update_obj.update_id}")
         user_id = update_obj.effective_user.id if update_obj.effective_user else "N/A"
-        async with application:
-            # Log user_data BEFORE processing if persistence is on (it would be loaded)
-            # if application.persistence:
-            #    loaded_user_data = await application.persistence.get_user_data()
-            #    logger.info(f"User data BEFORE process_update for user {user_id} (from persistence): {loaded_user_data.get(user_id, {})}")
-
+        async with application: # This ensures persistence data is loaded before handlers and flushed after
             await application.process_update(update_obj)
-
-            # Log user_data AFTER processing if persistence is on (it would be updated)
-            # if application.persistence:
-            #    updated_user_data = await application.persistence.get_user_data()
-            #    logger.info(f"User data AFTER process_update for user {user_id} (from persistence): {updated_user_data.get(user_id, {})}")
         logger.info("--- Application processed update successfully ---")
     except Exception as e:
         logger.error(f"!!! ERROR during application.process_update: {e} !!!", exc_info=True)
@@ -980,4 +1043,3 @@ if application:
 
 else:
     logger.warning("--- Skipping handler setup because Application initialization failed ---")
-
